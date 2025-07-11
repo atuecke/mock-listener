@@ -71,6 +71,7 @@ async def consumer(job_queue: asyncio.Queue,
         try:
             async with session.post(endpoint, data=form) as resp:
                 status_text = format_status(resp.status)
+                print(status_text, flush=True)
         except Exception as e:
             # on network or other exception, mark bold red
             status_text = Text(f"ERR: {e}", style="bold red")
@@ -150,7 +151,7 @@ async def main():
                         default=None)
     args = parser.parse_args()
 
-    endpoint = f"http://{args.ip}:8000/recording_endpoint"
+    endpoint = f"http://{args.ip}:8000/recordings_upload"
     if args.url:
         endpoint = args.url
 
