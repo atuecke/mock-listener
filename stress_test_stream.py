@@ -12,6 +12,9 @@ from rich.progress import Progress, BarColumn, TaskProgressColumn, TimeElapsedCo
 PAGE = 32_768            # 32 KiB payload per frame
 SEQ_META = 0xFFFFFF       # reserved for future metadata frames
 
+files_sent: dict[str, int] = {}
+seconds_sent: dict[str, float] = {}
+
 # ─────────────────────────────────────────────────────────────────────────────
 def fmt_status(code: int) -> Text:
     colour = ("green" if 200 <= code < 300 else
@@ -46,11 +49,12 @@ async def streamer(listener_id: str,
                    interval_s: float,
                    stagger_s: float,
                    endpoint: str,
+                   bytes_per_sec: int,       # ← NEW
                    progress: Progress,
                    task_id: int,
                    dashboard_hist: deque,
                    session: aiohttp.ClientSession):
-    """Maintain one long‑lived HTTP POST; restart seq=0 after each interval."""
+    """Maintain one long-lived HTTP POST; restart seq=0 after each interval."""
     if stagger_s > 0:
         await asyncio.sleep(random.uniform(0, stagger_s))
 
@@ -59,30 +63,55 @@ async def streamer(listener_id: str,
     async def body_gen():
         seq = 0
         while True:
-            # header frame
+            # 1) header frame
             yield make_frame(0, full_header)
             seq = 1
             progress.reset(task_id, total=total_pages, completed=0)
 
-            # PCM pages
+            # 2) PCM pages
             for ofs in range(0, len(pcm), PAGE):
                 payload = pcm[ofs:ofs + PAGE]
                 yield make_frame(seq, payload)
                 seq = (seq + 1) & 0xFFFFFF
                 progress.update(task_id, advance=1)
+
+                # ─── live totals ────────────────────────────────────────────────
+                seconds_sent[listener_id] += PAGE / bytes_per_sec
+                mins, secs = divmod(int(seconds_sent[listener_id]), 60)
+                hours, mins = divmod(mins, 60)
+                hms = f"{hours:02d}:{mins:02d}:{secs:02d}" if hours else f"{mins:02d}:{secs:02d}"
+                progress.update(task_id, time=hms)
+
                 await asyncio.sleep(page_dur)
 
-            # mark DONE in UI
-            dashboard_hist.appendleft((listener_id, Text("DONE", style="green"),
-                                        time.strftime("%H:%M:%S", time.gmtime())))
+            # 3) file finished ────── update dashboard + counters ─────────
+            dashboard_hist.appendleft(
+                (listener_id, Text("DONE", style="green"),
+                 time.strftime("%H:%M:%S", time.gmtime()))
+            )
+
+            files_sent[listener_id]   += 1                   # ← NEW
+            # seconds_sent[listener_id] += len(pcm) / bytes_per_sec
+
+            mins, secs = divmod(int(seconds_sent[listener_id]), 60)  # ← NEW
+            hours, mins = divmod(mins, 60)
+            hms = f"{hours:02d}:{mins:02d}:{secs:02d}" if hours else f"{mins:02d}:{secs:02d}"
+
+            progress.update(task_id,                          # ← NEW
+                            files=files_sent[listener_id],
+                            time=hms)
+
+            # 4) wait for next cycle
             await asyncio.sleep(interval_s)
 
+    # keep connection open
     start_ts = time.strftime("%H:%M:%S", time.gmtime())
     async with session.post(f"{endpoint}?listener_id={listener_id}",
                             data=body_gen()) as resp:
         dashboard_hist.appendleft((listener_id, fmt_status(resp.status), start_ts))
         await resp.text()
         await resp.wait_for_close()
+
 
 
 async def dashboard_updater(history: deque, progress: Progress):
@@ -126,20 +155,30 @@ async def main():
     page_dur = PAGE / bytes_per_sec
 
     progress = Progress(
-        "[progress.description]{task.fields[lid]}",
-        BarColumn(None), TaskProgressColumn(), TimeElapsedColumn(),
+        "[progress.description]{task.fields[lid]}"
+        "| n {task.fields[files]:>3} "
+        "| ⏱ {task.fields[time]} ",
+        BarColumn(None),
+        TaskProgressColumn(),
+        TimeElapsedColumn(),
     )
     hist = deque(maxlen=12)
-    task_ids = {
-        lid: progress.add_task("", lid=lid, total=1)
-        for lid in (f"listener{idx:02d}" for idx in range(1, args.num_sources + 1))
-    }
+    # ───── register tasks per listener ─────────────────────────────────
+    task_ids = {}
+    for lid in (f"listener{idx:02d}" for idx in range(1, args.num_sources + 1)):
+        files_sent[lid]   = 0
+        seconds_sent[lid] = 0.0
+        task_ids[lid] = progress.add_task(
+            "", lid=lid,
+            files=0, time="00:00",
+            total=1
+        )
 
     async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=None)) as session:
         stream_tasks = [
             asyncio.create_task(
-                streamer(lid, full_header, pcm, page_dur, args.interval,
-                         args.stagger, args.url, progress, task_ids[lid], hist, session)
+                streamer(lid, full_header, pcm, page_dur, args.interval, args.stagger,
+                         args.url, bytes_per_sec, progress, task_ids[lid], hist, session)
             )
             for lid in task_ids
         ]
