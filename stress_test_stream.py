@@ -9,7 +9,7 @@ from rich.table import Table
 from rich.text import Text
 from rich.progress import Progress, BarColumn, TaskProgressColumn, TimeElapsedColumn
 
-PAGE = 32_768            # 32 KiB payload per frame
+PAGE = 32_768            # 32 KiB payload per frame
 SEQ_META = 0xFFFFFF       # reserved for future metadata frames
 
 files_sent: dict[str, int] = {}
@@ -25,15 +25,19 @@ def fmt_status(code: int) -> Text:
     return Text(f"{code} {phrase}", style=colour)
 
 def make_frame(seq: int, payload: bytes) -> bytes:
-    """Return 5‑byte frame header + payload."""
-    return struct.pack("<I", seq)[:3] + struct.pack("<H", len(payload)) + payload
+    """Return 6-byte frame header + payload."""
+    seq_bytes = struct.pack("<I", seq)[:3]  # 3 bytes for sequence
+    payload_len = len(payload)
+    # Pack payload length as 3 bytes (little endian)
+    len_bytes = struct.pack("<I", payload_len)[:3]  # 3 bytes for length
+    return seq_bytes + len_bytes + payload
 # ─────────────────────────────────────────────────────────────────────────────
 
 
 def split_wav(wav_bytes: bytes) -> tuple[bytes, memoryview]:
     """
     Return (full_header, pcm_view).
-    Header ≡ everything up through `"data"` + 4‑byte size field.
+    Header ≡ everything up through `"data"` + 4-byte size field.
     """
     idx = wav_bytes.find(b"data")
     if idx < 0:
