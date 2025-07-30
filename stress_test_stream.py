@@ -68,6 +68,7 @@ async def streamer(listener_id: str,
         seq = 0
         while True:
             # 1) header frame
+            # yield make_frame(0, full_header + pcm[0:PAGE])
             yield make_frame(0, full_header)
             seq = 1
             progress.reset(task_id, total=total_pages, completed=0)
@@ -178,7 +179,8 @@ async def main():
             total=1
         )
 
-    async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=None)) as session:
+    timeout = aiohttp.ClientTimeout(total=None)
+    async with aiohttp.ClientSession(timeout=timeout, connector=aiohttp.TCPConnector(limit=None)) as session:
         stream_tasks = [
             asyncio.create_task(
                 streamer(lid, full_header, pcm, page_dur, args.interval, args.stagger,
