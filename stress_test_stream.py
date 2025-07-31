@@ -53,70 +53,130 @@ async def streamer(listener_id: str,
                    interval_s: float,
                    stagger_s: float,
                    endpoint: str,
-                   bytes_per_sec: int,       # ← NEW
+                   bytes_per_sec: int,
                    progress: Progress,
                    task_id: int,
                    dashboard_hist: deque,
                    session: aiohttp.ClientSession):
-    """Maintain one long-lived HTTP POST; restart seq=0 after each interval."""
+    """Maintain one long-lived HTTP POST; restart seq=0 after each interval. Auto-reconnect on failure."""
     if stagger_s > 0:
         await asyncio.sleep(random.uniform(0, stagger_s))
 
     total_pages = (len(pcm) + PAGE - 1) // PAGE
+    retry_count = 0
+    max_retry_delay = 60  # Maximum delay between retries (seconds)
+    
+    # State variables to track streaming progress
+    current_offset = 0
+    current_seq = 0
+    in_interval_wait = False
+    interval_wait_remaining = 0
+    
+    while True:  # Outer retry loop
+        try:
+            async def body_gen():
+                nonlocal current_offset, current_seq, in_interval_wait, interval_wait_remaining
+                
+                # If we were in the middle of waiting between files, complete the wait
+                if in_interval_wait and interval_wait_remaining > 0:
+                    await asyncio.sleep(interval_wait_remaining)
+                    in_interval_wait = False
+                    interval_wait_remaining = 0
+                
+                while True:
+                    # 1) header frame - start new file
+                    yield make_frame(0, full_header)
+                    current_seq = 1
+                    current_offset = 0
+                    progress.reset(task_id, total=total_pages, completed=0)
 
-    async def body_gen():
-        seq = 0
-        while True:
-            # 1) header frame
-            # yield make_frame(0, full_header + pcm[0:PAGE])
-            yield make_frame(0, full_header)
-            seq = 1
-            progress.reset(task_id, total=total_pages, completed=0)
+                    # 2) PCM pages
+                    while current_offset < len(pcm):
+                        payload = pcm[current_offset:current_offset + PAGE]
+                        yield make_frame(current_seq, payload)
+                        current_seq = (current_seq + 1) & 0xFFFFFF
+                        current_offset += PAGE
+                        progress.update(task_id, advance=1)
 
-            # 2) PCM pages
-            for ofs in range(0, len(pcm), PAGE):
-                payload = pcm[ofs:ofs + PAGE]
-                yield make_frame(seq, payload)
-                seq = (seq + 1) & 0xFFFFFF
-                progress.update(task_id, advance=1)
+                        # ─── live totals ────────────────────────────────────────────────
+                        seconds_sent[listener_id] += min(PAGE, len(payload)) / bytes_per_sec
+                        mins, secs = divmod(int(seconds_sent[listener_id]), 60)
+                        hours, mins = divmod(mins, 60)
+                        hms = f"{hours:02d}:{mins:02d}:{secs:02d}" if hours else f"{mins:02d}:{secs:02d}"
+                        progress.update(task_id, time=hms)
 
-                # ─── live totals ────────────────────────────────────────────────
-                seconds_sent[listener_id] += PAGE / bytes_per_sec
-                mins, secs = divmod(int(seconds_sent[listener_id]), 60)
-                hours, mins = divmod(mins, 60)
-                hms = f"{hours:02d}:{mins:02d}:{secs:02d}" if hours else f"{mins:02d}:{secs:02d}"
-                progress.update(task_id, time=hms)
+                        await asyncio.sleep(page_dur)
 
-                await asyncio.sleep(page_dur)
+                    # 3) file finished ────── update dashboard + counters ─────────
+                    dashboard_hist.appendleft(
+                        (listener_id, Text("DONE", style="green"),
+                         time.strftime("%H:%M:%S", time.gmtime()))
+                    )
 
-            # 3) file finished ────── update dashboard + counters ─────────
+                    files_sent[listener_id] += 1
+                    mins, secs = divmod(int(seconds_sent[listener_id]), 60)
+                    hours, mins = divmod(mins, 60)
+                    hms = f"{hours:02d}:{mins:02d}:{secs:02d}" if hours else f"{mins:02d}:{secs:02d}"
+
+                    progress.update(task_id,
+                                    files=files_sent[listener_id],
+                                    time=hms)
+
+                    # 4) wait for next cycle
+                    in_interval_wait = True
+                    interval_wait_start = time.time()
+                    await asyncio.sleep(interval_s)
+                    in_interval_wait = False
+                    interval_wait_remaining = 0
+
+            # Try to establish connection and stream
+            start_ts = time.strftime("%H:%M:%S", time.gmtime())
+            
+            # Update dashboard to show connecting status if this is a retry
+            if retry_count > 0:
+                dashboard_hist.appendleft(
+                    (listener_id, Text(f"RETRY #{retry_count}", style="yellow"),
+                     time.strftime("%H:%M:%S", time.gmtime()))
+                )
+            
+            async with session.post(f"{endpoint}?listener_id={listener_id}",
+                                    data=body_gen()) as resp:
+                # Connection successful, reset retry count
+                retry_count = 0
+                dashboard_hist.appendleft((listener_id, fmt_status(resp.status), start_ts))
+                
+                # If we get a successful connection, stream until connection closes
+                await resp.text()
+                await resp.wait_for_close()
+                
+        except (aiohttp.ClientError, asyncio.TimeoutError, ConnectionError) as e:
+            # Connection failed or was lost
+            retry_count += 1
+            retry_delay = min(2 ** retry_count, max_retry_delay)  # Exponential backoff
+            
+            error_msg = type(e).__name__
+            if hasattr(e, 'message'):
+                error_msg = f"{error_msg}: {e.message}"
+            
             dashboard_hist.appendleft(
-                (listener_id, Text("DONE", style="green"),
+                (listener_id, Text(f"ERROR: {error_msg}", style="red"),
                  time.strftime("%H:%M:%S", time.gmtime()))
             )
-
-            files_sent[listener_id]   += 1                   # ← NEW
-            # seconds_sent[listener_id] += len(pcm) / bytes_per_sec
-
-            mins, secs = divmod(int(seconds_sent[listener_id]), 60)  # ← NEW
-            hours, mins = divmod(mins, 60)
-            hms = f"{hours:02d}:{mins:02d}:{secs:02d}" if hours else f"{mins:02d}:{secs:02d}"
-
-            progress.update(task_id,                          # ← NEW
-                            files=files_sent[listener_id],
-                            time=hms)
-
-            # 4) wait for next cycle
-            await asyncio.sleep(interval_s)
-
-    # keep connection open
-    start_ts = time.strftime("%H:%M:%S", time.gmtime())
-    async with session.post(f"{endpoint}?listener_id={listener_id}",
-                            data=body_gen()) as resp:
-        dashboard_hist.appendleft((listener_id, fmt_status(resp.status), start_ts))
-        await resp.text()
-        await resp.wait_for_close()
-
+            
+            dashboard_hist.appendleft(
+                (listener_id, Text(f"Retry in {retry_delay}s", style="orange"),
+                 time.strftime("%H:%M:%S", time.gmtime()))
+            )
+            
+            await asyncio.sleep(retry_delay)
+            
+        except Exception as e:
+            # Unexpected error - log it but keep trying
+            dashboard_hist.appendleft(
+                (listener_id, Text(f"UNEXPECTED: {type(e).__name__}", style="bright_red"),
+                 time.strftime("%H:%M:%S", time.gmtime()))
+            )
+            await asyncio.sleep(5)  # Brief pause before retry
 
 
 async def dashboard_updater(history: deque, progress: Progress):
@@ -125,7 +185,7 @@ async def dashboard_updater(history: deque, progress: Progress):
             tbl = Table(show_header=True, header_style="bold magenta",
                         row_styles=["none", "dim"])
             tbl.add_column("Listener",  width=12)
-            tbl.add_column("Status",    width=14)
+            tbl.add_column("Status",    width=20)  # Increased width for error messages
             tbl.add_column("Time UTC",  width=10)
             for lid, status_text, ts in history:
                 tbl.add_row(lid, status_text, ts)
@@ -167,7 +227,7 @@ async def main():
         TaskProgressColumn(),
         TimeElapsedColumn(),
     )
-    hist = deque(maxlen=12)
+    hist = deque(maxlen=20)  # Increased to show more history including errors
     # ───── register tasks per listener ─────────────────────────────────
     task_ids = {}
     for lid in (f"listener{idx:02d}" for idx in range(1, args.num_sources + 1)):
